@@ -1,0 +1,458 @@
+---
+title: "YM_EJ_RNASeq"
+author: "Yilun"
+date: "2024-01-08"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+#Setup
+```{r packages}
+library("tidyverse")
+library("DESeq2")
+```
+
+#Ensembl annotations
+``` {r Ensembl annotations}
+library("tximport")
+library("readr")
+library("ensembldb")
+library("EnsDb.Hsapiens.v86")
+edb <- EnsDb.Hsapiens.v86
+Tx <- transcripts(edb, return.type="DataFrame")
+tx2gene <- data.frame(TXNAME = Tx$tx_name, GENEID = Tx$gene_id)
+head(tx2gene)
+```
+
+``` {r Samples}
+dir <- "C:/Users/yilun/Documents/EJ_RNASeq/salmon_quants"
+setwd(dir)
+files <- list.files(dir)
+names(files) <- rep(c("D", "D_OA", "EV", "EV_OA"), each=3)
+all(file.exists(files))
+
+samples <- data.frame(samples = c("D1", "D2", "D3", "D_OA1", "D_OA2", "D_OA3", "EV1", "EV2", "EV3", "EV_OA1", "EV_OA2", "EV_OA3"))
+samples$condition <- factor(rep(c("D", "D_OA", "EV", "EV_OA"), each=3))
+samples$replicate <- factor(rep(c("1", "2", "3"), 4))
+samples
+```
+
+```{r Import}
+txi <- tximport(files, type = "salmon", tx2gene = tx2gene, ignoreTxVersion = TRUE)
+
+write.csv(txi$abundance, file = "C:/Users/yilun/Documents/EJ_RNASeq/matrix_salmon_abundance.csv")
+write.csv(txi$counts, file = "C:/Users/yilun/Documents/EJ_RNASeq/matrix_salmon_counts.csv")
+```
+
+```{r DESeq}
+library("DESeq2")
+dds <- DESeqDataSetFromTximport(txi,
+                                colData = samples,
+                                design = ~ condition)
+dds <- DESeq(dds)
+```
+
+```{r Pre-filtering}
+keep <- rowSums(counts(dds)) >= 1
+dds <- dds[keep,]
+```
+
+```{r QC}
+vsd <- vst(dds, blind=FALSE)
+rld <- rlog(dds, blind=FALSE)
+
+library("vsn")
+meanSdPlot(assay(vsd))
+
+sampleDists <- dist(t(assay(vsd)))
+
+library("RColorBrewer")
+library("pheatmap")
+
+sampleDistMatrix <- as.matrix(sampleDists)
+rownames(sampleDistMatrix) <- paste(vsd$condition, vsd$type, sep="-")
+colnames(sampleDistMatrix) <- NULL
+colors <- colorRampPalette( rev(brewer.pal(9, "Blues")) )(255)
+pdf("sampledist_heatmap.pdf")
+pheatmap::pheatmap(sampleDistMatrix,
+         clustering_distance_rows=sampleDists,
+         clustering_distance_cols=sampleDists,
+         col=colors)
+dev.off()
+
+
+```
+Normalization and PCA.
+``` {r}
+dds_norm <- vst(dds, blind = F)
+
+# PCA
+pcaData <- plotPCA(object = dds_norm,
+                   intgroup = "condition",
+                   returnData = F)
+percentVar <- round(100 * attr(pcaData, "percentVar")) # calculate percent variance for the different PCs
+
+plotPCA(vsd, intgroup="condition")
+ggsave("plotPCA_nofilt.pdf")
+plotPCA(vsd, intgroup = "condition", ntop = 50000, returnData = FALSE)
+```
+
+``` {r ensembl}
+library(biomaRt)
+ensembl <- useEnsembl(biomart = "genes", dataset = "hsapiens_gene_ensembl", version = 110)
+
+annotations <- getBM(attributes = c("ensembl_gene_id", "hgnc_symbol", "description"),
+                     filters = "ensembl_gene_id",
+                     values = genes,
+                     mart = ensembl)
+annotations_gene_names <- getBM(attributes = c("ensembl_gene_id", "hgnc_symbol"),
+                     filters = "ensembl_gene_id",
+                     values = genes,
+                     mart = ensembl)
+
+annotations <- annotations %>% mutate(hgnc_symbol = ifelse(hgnc_symbol == "", ensembl_gene_id, hgnc_symbol))
+annotations_gene_names <- annotations_gene_names %>% mutate(hgnc_symbol = ifelse(hgnc_symbol == "", ensembl_gene_id, hgnc_symbol))
+```
+
+``` {r PC genes}
+vst_norm_matrix <- assay(dds_norm) # extract normalized counts matrix from deseq_matrix_norm calculated above
+pca_data_for_extracting_genes <- prcomp(t(vst_norm_matrix)) # re-run PCA to extract genes
+# extract data with the contribution of each gene to the PCA calculation:
+pca_gene_info <- pca_data_for_extracting_genes$rotation %>%
+  data.frame() %>%
+  rownames_to_column(var = "Ensembl") %>%  merge(x = ., y = annotations, by.x = "Ensembl", by.y = "ensembl_gene_id") 
+n_genes <- 10 # select number of genes you want to look at
+# PC1:
+PC1_high <- pca_gene_info %>% arrange(-PC1) %>% head(., n_genes) %>% pull(hgnc_symbol) # pull out the PC1 high genes
+PC1_low <- pca_gene_info %>% arrange(-PC1) %>% tail(., n_genes) %>% pull(hgnc_symbol) # pull out the PC1 low genes
+
+# print results
+message('PC1 high genes:')
+message(paste(PC1_high, sep = " ", collapse = ", "))
+message('PC1 low genes:')
+message(paste(PC1_low, sep = " ", collapse = ", "))
+```
+
+```{r Transformation Heatmaps}
+# select <- order(rowMeans(counts(dds,normalized=TRUE)),decreasing=TRUE)[1:20]
+# nt <- normTransform(dds) # defaults to log2(x+1)
+# log2.norm.counts <- assay(nt)[select,]
+# df_dds <- as.data.frame(colData(dds)[ ,c("condition")])
+# 
+# pheatmap(log2.norm.counts, cluster_rows = FALSE, show_rownames = TRUE,
+#          cluster_cols = FALSE, main="log2(norm counts)", annotation_col = df_dds)
+# pheatmap(assay(rld)[select,], cluster_rows = FALSE, show_rownames = TRUE,
+#          cluster_cols = FALSE, main="rld", annotation_col = df_dds)
+# pheatmap(assay(vsd)[select,], cluster_rows = FALSE, show_rownames = TRUE,
+#          cluster_cols = FALSE, main="vsd", annotation_col = df_dds)
+```
+
+Load pathways for GSEA.
+``` {r}
+library("msigdbr")
+library("fgsea")
+human.genes <- msigdbr(species = "Homo sapiens")
+
+# GO biological pathways
+genesets.GOBP <- filter(human.genes, gs_subcat == "GO:BP")
+pathways.GOBP <- genesets.GOBP %>% split(x = .$gene_symbol, f = .$gs_name)
+# GO CC
+genesets.GOCC <- filter(human.genes, gs_subcat == "GO:CC")
+pathways.GOCC <- genesets.GOCC %>% split(x = .$gene_symbol, f = .$gs_name)
+
+genesets.hallmark <- filter(human.genes, gs_cat == "H")
+pathways.hallmark <- genesets.hallmark %>% split(x = .$gene_symbol, f = .$gs_name)
+
+genesets.KEGG <- filter(human.genes, gs_subcat == "CP:KEGG")
+pathways.KEGG <- genesets.KEGG %>% split(x = .$gene_symbol, f = .$gs_name)
+```
+
+DHRS3 Overexpression vs. Empty Vector
+```{r D vs. EV}
+#DEG
+D_EV_res <- results(dds, contrast = c("condition", "D", "EV"))
+summary(D_EV_res)
+
+D_EV_res_annotated <- data.frame(D_EV_res) %>% rownames_to_column(var = "Ensembl") %>% merge(x = ., y = annotations, by.x = "Ensembl", by.y = "ensembl_gene_id") %>% filter(padj < 0.05) %>% arrange(desc(log2FoldChange))
+
+write.csv(D_EV_res_annotated, "D_EV_res_annotated.csv")
+
+#GSEA
+D_EV_gsea_genelist <- D_EV_res_annotated %>% dplyr::select(hgnc_symbol, log2FoldChange) %>% deframe()
+
+set.seed(9315)
+D_EV_GOBP <- fgseaMultilevel(pathways = pathways.GOBP, stats = D_EV_gsea_genelist, minSize = 5, maxSize = 500) %>% arrange(desc(NES))
+D_EV_GOCC <- fgseaMultilevel(pathways = pathways.GOCC, stats = D_EV_gsea_genelist, minSize = 5, maxSize = 500) %>% arrange(desc(NES))
+D_EV_Hallmark <- fgseaMultilevel(pathways = pathways.hallmark, stats = D_EV_gsea_genelist, minSize = 5, maxSize = 500) %>% arrange(desc(NES))
+D_EV_KEGG <- fgseaMultilevel(pathways = pathways.KEGG, stats = D_EV_gsea_genelist, minSize = 5, maxSize = 500) %>% arrange(desc(NES))
+
+ #GSEA Plot
+ n_terms <- 10 # Number of terms you want to plot
+ gsea_results_plot <- D_EV_KEGG %>% #Change to GSEA set that you want to plot
+   arrange(-NES) %>% # Sort GSEA results by NES
+   slice(., 1:n_terms) # Take the top 10 pathways by NES
+   
+ # Make the pathway column into a factor variable, so that the Y-axis is plotted in the correct (descending) order
+ gsea_results_plot$pathway <- factor(gsea_results_plot$pathway, levels = rev(gsea_results_plot$pathway))
+ 
+ # Generate plot
+ library(viridis)
+ # Create the ggplot
+ ggplot(gsea_results_plot, aes(x = NES, y = pathway, fill = padj)) + 
+   geom_bar(stat = "identity") + 
+   scale_fill_viridis(name = "Adjusted P-Value",  # Legend title
+                      limits = c(min(gsea_results_plot$padj, na.rm = TRUE), 
+                                 max(gsea_results_plot$padj, na.rm = TRUE))) +  # Adjust color scale as needed
+   theme_minimal() + 
+   xlab("NES") +
+   theme(axis.title.x = element_text(size = 13, color = "black"),
+         axis.title.y = element_blank(),
+         axis.text.y = element_text(size = 5, color = "black"),
+         axis.text.x = element_text(size = 12, color = "black"),
+         legend.position = "right")  # Adjust legend position as needed
+ ggsave("D_EV_KEGG_500.pdf")
+```
+
+DHRS3 Overexpression with OA vs. Empty Vector with OA
+```{r DOA vs. EVOA}
+#DEG
+DOA_EVOA_res <- results(dds, contrast = c("condition", "D_OA", "EV_OA"))
+DOA_EVOA_res_annotated <- data.frame(DOA_EVOA_res) %>% rownames_to_column(var = "Ensembl") %>% merge(x = ., y = annotations, by.x = "Ensembl", by.y = "ensembl_gene_id") %>% filter(padj < 0.05) %>% arrange(desc(log2FoldChange))
+write.csv(DOA_EVOA_res_annotated, "DOA_EVOA_res_annotated.csv")
+
+#GSEA
+DOA_EVOA_gsea_genelist <- DOA_EVOA_res_annotated %>% dplyr::select(hgnc_symbol, log2FoldChange) %>% deframe()
+
+set.seed(9315)
+DOA_EVOA_GOBP <- fgseaMultilevel(pathways = pathways.GOBP, stats = DOA_EVOA_gsea_genelist, minSize = 5, maxSize = 250) %>% arrange(desc(NES))
+DOA_EVOA_GOCC <- fgseaMultilevel(pathways = pathways.GOCC, stats = DOA_EVOA_gsea_genelist, minSize = 5, maxSize = 250) %>% arrange(desc(NES))
+DOA_EVOA_Hallmark <- fgseaMultilevel(pathways = pathways.hallmark, stats = DOA_EVOA_gsea_genelist, minSize = 5, maxSize = 250) %>% arrange(desc(NES))
+DOA_EVOA_KEGG <- fgseaMultilevel(pathways = pathways.KEGG, stats = DOA_EVOA_gsea_genelist, minSize = 5, maxSize = 250) %>% arrange(desc(NES))
+```
+
+DHRS3 Overexpression with OA vs. DHRS3 Overexpression without OA
+```{r DOA vs. D}
+#DEG
+DOA_D_res <- results(dds, contrast = c("condition", "D_OA", "D"))
+DOA_D_res_annotated <- data.frame(DOA_D_res) %>% rownames_to_column(var = "Ensembl") %>% merge(x = ., y = annotations, by.x = "Ensembl", by.y = "ensembl_gene_id") %>% filter(padj < 0.05) %>% arrange(desc(log2FoldChange))
+
+write.csv(DOA_D_res_annotated, "DOA_D_res_annotated.csv")
+
+#GSEA
+DOA_D_gsea_genelist <- DOA_D_res_annotated %>% dplyr::select(hgnc_symbol, log2FoldChange) %>% deframe()
+
+set.seed(9315)
+DOA_D_GOBP <- fgseaMultilevel(pathways = pathways.GOBP, stats = DOA_D_gsea_genelist, minSize = 5, maxSize = 250) %>% arrange(desc(NES))
+DOA_D_GOCC <- fgseaMultilevel(pathways = pathways.GOCC, stats = DOA_D_gsea_genelist, minSize = 5, maxSize = 250) %>% arrange(desc(NES))
+DOA_D_Hallmark <- fgseaMultilevel(pathways = pathways.hallmark, stats = DOA_D_gsea_genelist, minSize = 5, maxSize = 250) %>% arrange(desc(NES))
+DOA_D_KEGG <- fgseaMultilevel(pathways = pathways.KEGG, stats = DOA_D_gsea_genelist, minSize = 5, maxSize = 250) %>% arrange(desc(NES))
+```
+
+EV with OA vs. EV without OA
+```{r EVOA vs. E}
+#DEG
+EVOA_EV_res <- results(dds, contrast = c("condition", "EV_OA", "EV"))
+EVOA_EV_res_annotated <- data.frame(EVOA_EV_res) %>% rownames_to_column(var = "Ensembl") %>% merge(x = ., y = annotations, by.x = "Ensembl", by.y = "ensembl_gene_id") %>% filter(padj < 0.05) %>% arrange(desc(log2FoldChange))
+
+write.csv(EVOA_EV_res_annotated, "EVOA_EV_res_annotated.csv")
+
+#GSEA
+EVOA_EV_gsea_genelist <- EVOA_EV_res_annotated %>% dplyr::select(hgnc_symbol, log2FoldChange) %>% deframe()
+
+set.seed(9315)
+EVOA_EV_GOBP <- fgseaMultilevel(pathways = pathways.GOBP, stats = EVOA_EV_gsea_genelist, minSize = 5, maxSize = 250) %>% arrange(desc(NES))
+EVOA_EV_GOCC <- fgseaMultilevel(pathways = pathways.GOCC, stats = EVOA_EV_gsea_genelist, minSize = 5, maxSize = 250) %>% arrange(desc(NES))
+EVOA_EV_Hallmark <- fgseaMultilevel(pathways = pathways.hallmark, stats = EVOA_EV_gsea_genelist, minSize = 5, maxSize = 250) %>% arrange(desc(NES))
+EVOA_EV_KEGG <- fgseaMultilevel(pathways = pathways.KEGG, stats = EVOA_EV_gsea_genelist, minSize = 5, maxSize = 250) %>% arrange(desc(NES))
+```
+
+D with OA vs. EV with OA
+```{r EVOA vs. E}
+#DEG
+DOA_EVOA_res <- results(dds, contrast = c("condition", "D_OA", "EV_OA"))
+DOA_EVOA_res_annotated <- data.frame(DOA_EVOA_res) %>% rownames_to_column(var = "Ensembl") %>% merge(x = ., y = annotations, by.x = "Ensembl", by.y = "ensembl_gene_id") %>% filter(padj < 0.05) %>% arrange(desc(log2FoldChange))
+
+write.csv(DOA_EVOA_res_annotated, "DOA_EVOA_res_annotated.csv")
+
+#GSEA
+DOA_EVOA_gsea_genelist <- DOA_EVOA_res_annotated %>% dplyr::select(hgnc_symbol, log2FoldChange) %>% deframe()
+
+set.seed(9315)
+DOA_EVOA_GOBP <- fgseaMultilevel(pathways = pathways.GOBP, stats = DOA_EVOA_gsea_genelist, minSize = 5, maxSize = 250) %>% arrange(desc(NES))
+DOA_EVOA_GOCC <- fgseaMultilevel(pathways = pathways.GOCC, stats = DOA_EVOA_gsea_genelist, minSize = 5, maxSize = 250) %>% arrange(desc(NES))
+DOA_EVOA_Hallmark <- fgseaMultilevel(pathways = pathways.hallmark, stats = DOA_EVOA_gsea_genelist, minSize = 5, maxSize = 250) %>% arrange(desc(NES))
+DOA_EVOA_KEGG <- fgseaMultilevel(pathways = pathways.KEGG, stats = DOA_EVOA_gsea_genelist, minSize = 5, maxSize = 250) %>% arrange(desc(NES))
+```
+
+```{r files}
+norm_counts <- counts(dds, normalized = TRUE) %>% data.frame(.) %>% rownames_to_column(var = "Ensembl") %>% merge(x = ., y = annotations, by.x = "Ensembl", by.y = "ensembl_gene_id")
+write.csv(norm_counts, file="norm_counts_salmon.csv")
+
+D_EV_norm_counts <- data.frame(D_EV_res) %>% rownames_to_column(var = "Ensembl") %>% merge(x = ., y = norm_counts, by.x = "Ensembl", by.y = "Ensembl")
+write.csv(D_EV_norm_counts, file="D_EV_norm_counts.csv")
+```
+
+
+Volcano plot (only run this after the part above so you can label named genes):
+``` {r}
+for_volcano <- D_EV_res_annotated
+
+pval_cutoff <- 0.05
+log2FC_cutoff <- 0.25
+
+for_volcano$up_or_down <- case_when(
+  for_volcano$log2FoldChange > log2FC_cutoff & for_volcano$padj < pval_cutoff ~ 'up',
+  for_volcano$log2FoldChange < -log2FC_cutoff & for_volcano$padj < pval_cutoff ~ 'down',
+  TRUE ~ 'neither'
+)
+
+genes_to_label <- for_volcano %>% filter(log2FoldChange > 1 & -log10(padj) > 1.3 | log2FoldChange < -1 & -log10(padj) > 1.3) # can play around with this to label genes of interest
+
+
+n_down <- for_volcano[!is.na(for_volcano$padj),] %>% filter(log2FoldChange < -log2FC_cutoff & padj < pval_cutoff) %>% nrow()
+n_up <- for_volcano[!is.na(for_volcano$padj),] %>% filter(log2FoldChange > log2FC_cutoff & padj < pval_cutoff) %>% nrow()
+
+ggplot(for_volcano, aes(x = log2FoldChange, y = -log10(padj), color = up_or_down)) +
+  geom_hline(yintercept = -log10(0.05), linetype = 'dashed') +
+  geom_vline(xintercept = c(log2FC_cutoff, -log2FC_cutoff), linetype = 'dashed') +
+  geom_point() +
+  scale_color_manual(values = c('#3CBCCE',  'grey', '#CE4E3C'),
+                     labels = c(paste('downregulated genes\nn =', n_down), 
+                                'neither',
+                                paste('upregulated genes\nn =', n_up))) +
+  #scale_color_discrete() +
+  #theme_minimal() +
+  ylab('-log10 adjusted p-value') +
+  xlab('log2 fold change') +
+  theme(axis.text = element_text(size = 14, color = 'black'),
+        axis.title = element_text(size = 16, color = 'black'),
+        legend.title = element_blank(),
+        legend.text = element_text(size = 12, color = 'black')) +
+  ggrepel::geom_text_repel(data = genes_to_label, aes(label = hgnc_symbol),
+                  box.padding = unit(0.5, 'lines'),
+                  point.padding = unit(0.75, 'lines'),
+                  max.overlaps = 30,
+                  min.segment.length = 0,
+                  color = 'black',
+                  #seed = 101,
+                  show.legend = F) 
+
+ggsave("D_EV_volcanplot.pdf")
+
+
+```
+
+
+#Eleanor plots
+
+Plot Rich's GSEA results
+```{r}
+D_EV_hallmark <- read_csv("/Users/johnse/Library/CloudStorage/GoogleDrive-johnse@mskcc.org/.shortcut-targets-by-id/14UTPA-dZTxL5y11taKz7Qmil45hUDuFG/Lab members/Eleanor Johns/Rich_GSEAAnalysis_forRNAseq/eleanor dhrs3 gsea/gsea results on filtered salmon data/my_analysis.Gsea.1705992952075/gsea_report_for_D_1705992952075.csv")
+D_EV_GOBP <- read_csv("/Users/johnse/Library/CloudStorage/GoogleDrive-johnse@mskcc.org/.shortcut-targets-by-id/14UTPA-dZTxL5y11taKz7Qmil45hUDuFG/Lab members/Eleanor Johns/Rich_GSEAAnalysis_forRNAseq/eleanor dhrs3 gsea/gsea results on filtered salmon data/my_analysis.Gsea.1705993120019/gsea_report_for_D_1705993120019.csv")
+D_EV_WP <- read_csv("/Users/johnse/Library/CloudStorage/GoogleDrive-johnse@mskcc.org/.shortcut-targets-by-id/14UTPA-dZTxL5y11taKz7Qmil45hUDuFG/Lab members/Eleanor Johns/Rich_GSEAAnalysis_forRNAseq/eleanor dhrs3 gsea/gsea results on filtered salmon data/my_analysis.Gsea.1705993022215/gsea_report_for_D_1705993022215.csv")
+
+
+#GSEA Plot
+n_terms <- 10 # Number of terms you want to plot
+gsea_results_plot <- D_EV_WP %>% #Change to GSEA set that you want to plot
+  arrange(-NES) %>% # Sort GSEA results by NES
+  dplyr::slice(1:n_terms) # Take the top 10 pathways by log10pvalue
+  
+# Make the pathway column into a factor variable, so that the Y-axis is plotted in the correct (descending) order
+gsea_results_plot$NAME <- factor(gsea_results_plot$NAME, levels = rev(gsea_results_plot$NAME))
+
+# Generate plot
+library(viridis)
+# Create the ggplot
+ggplot(gsea_results_plot, aes(x = NES, y = NAME, fill = FDR_q_val)) + 
+  geom_bar(stat = "identity") + 
+  scale_fill_viridis(name = "FDR q-val",  # Legend title
+                     limits = c(min(gsea_results_plot$FDR_q_val, na.rm = TRUE), 
+                                max(gsea_results_plot$FDR_q_val, na.rm = TRUE))) +  # Adjust color scale as needed
+  theme_minimal() + 
+  xlab("NES") +
+  theme(axis.title.x = element_text(size = 13, color = "black"),
+        axis.title.y = element_blank(),
+        axis.text.y = element_text(size = 5, color = "black"),
+        axis.text.x = element_text(size = 13, color = "black"),
+        legend.position = "right")  # Adjust legend position as needed
+
+ggsave("D_EV_WP.pdf")
+
+```
+
+
+Customized GSEA with melanoma cell state signatures
+```{r}
+
+library("qusage")
+gene_sets <- read.gmt("Copy of NatePathways_newgmt.gmt")
+gene_sets_tsoi <- read.gmt("TsoiSignatures.gmt")
+
+
+D_EV_gsea_genelist <- D_EV_res_annotated %>% dplyr::select(hgnc_symbol, log2FoldChange) %>% deframe()
+
+set.seed(9315)
+D_EV_Nate <- fgseaMultilevel(pathways = gene_sets, stats = D_EV_gsea_genelist, minSize = 2, maxSize = 500) %>% arrange(desc(NES))
+D_EV_Tsoi <- fgseaMultilevel(pathways = gene_sets_tsoi, stats = D_EV_gsea_genelist, minSize = 2, maxSize = 500) %>% arrange(desc(NES))
+
+
+```
+
+```{r}
+#GSEA Plot
+n_terms <- 4 # Number of terms you want to plot
+gsea_results_plot <- D_EV_Tsoi %>% #Change to GSEA set that you want to plot
+  arrange(NES) %>% # Sort GSEA results by NES
+  dplyr::slice(1:n_terms) # Take the top 10 pathways by NES
+  
+# Make the pathway column into a factor variable, so that the Y-axis is plotted in the correct (descending) order
+gsea_results_plot$pathway <- factor(gsea_results_plot$pathway, levels = rev(gsea_results_plot$pathway))
+
+# Generate plot
+library(viridis)
+# Create the ggplot
+ggplot(gsea_results_plot, aes(x = NES, y = pathway, fill = padj)) + 
+  geom_bar(stat = "identity") + 
+  scale_fill_viridis(name = "Adjusted P-Value",  # Legend title
+                     limits = c(min(gsea_results_plot$padj, na.rm = TRUE), 
+                                max(gsea_results_plot$padj, na.rm = TRUE))) +  # Adjust color scale as needed
+  theme_minimal() + 
+  xlab("NES") +
+  theme(axis.title.x = element_text(size = 13, color = "black"),
+        axis.title.y = element_blank(),
+        axis.text.y = element_text(size = 13, color = "black"),
+        axis.text.x = element_text(size = 13, color = "black"),
+        legend.position = "right")  # Adjust legend position as needed
+
+ggsave("Tsoi_sig_gsea.pdf")
+
+#make some barcode plots
+pdf("Tsoi_undifferentiated_barcode.pdf")
+barcode_plot(pathway = "Undifferentiated", gsea_pathways = gene_sets_tsoi, gsea_vector = D_EV_gsea_genelist, gsea_results = D_EV_Tsoi)
+dev.off()
+
+pdf("Tsoi_neuralcrest_barcode.pdf")
+barcode_plot(pathway = "NeuralCrest", gsea_pathways = gene_sets_tsoi, gsea_vector = D_EV_gsea_genelist, gsea_results = D_EV_Tsoi)
+dev.off()
+
+pdf("Tsoi_undifferentiated_enrichment.pdf")
+plotEnrichment(gene_sets_tsoi[["Undifferentiated"]],
+   D_EV_gsea_genelist, ticksSize = 0.5) + labs(title="Undifferentiated") +
+  theme(text=element_text(size=21))
+    #theme(axis.title.x = element_text(size = 13),
+     #   axis.title.y = element_text(size = 13),
+      #  axis.text.y = element_text(size = 13),
+       # axis.text.x = element_text(size = 13), 
+        # legend.position = "right")
+dev.off()
+
+pdf("Tsoi_neuralcrest_enrichment.pdf")
+plotEnrichment(gene_sets_tsoi[["NeuralCrest"]],
+   D_EV_gsea_genelist, ticksSize = 0.5) + labs(title="NeuralCrest") +
+  theme(text=element_text(size=21))
+dev.off()
+
+```
